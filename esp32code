@@ -1,0 +1,950 @@
+/*
+ * IoT-Based Bell Monitoring System
+ * Features:
+ * - RTC DS3231 for accurate timekeeping
+ * - OLED SSD1306 display for status
+ * - GPS module for location & time sync
+ * - Relay control for bell
+ * - Multiple bell schedules
+ * - Serial interface for configuration
+ * - WiFi connectivity for IoT monitoring
+ */
+
+#include <Wire.h>
+#include <RTClib.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <TinyGPS++.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ==================== Configuration ====================
+// WiFi Credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// OLED Display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+
+// Pin Definitions
+#define RELAY_PIN 23      // Relay for bell
+#define BUZZER_PIN 25     // Optional buzzer
+#define LED_PIN 2         // Built-in LED for status
+
+// I2C Pins
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// GPS UART Pins
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+
+// Bell Configuration
+#define MAX_BELL_SCHEDULES 20
+#define BELL_DURATION 5000  // Bell ring duration in ms
+
+// ==================== Objects ====================
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+RTC_DS3231 rtc;
+TinyGPSPlus gps;
+HardwareSerial SerialGPS(2);
+WebServer server(80);
+
+// ==================== Data Structures ====================
+struct BellSchedule {
+  uint8_t hour;
+  uint8_t minute;
+  bool enabled;
+  bool daysOfWeek[7];  // Sunday = 0, Monday = 1, etc.
+  char label[20];
+};
+
+struct SystemStatus {
+  bool rtcOK;
+  bool displayOK;
+  bool gpsValid;
+  bool wifiConnected;
+  double latitude;
+  double longitude;
+  int bellRingCount;
+  unsigned long lastBellTime;
+};
+
+// ==================== Global Variables ====================
+BellSchedule bellSchedule[MAX_BELL_SCHEDULES];
+int bellCount = 0;
+SystemStatus status;
+
+String inputString = "";
+bool inputComplete = false;
+
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastGPSCheck = 0;
+int displayPage = 0;
+
+// ==================== Function Prototypes ====================
+void initializeSystem();
+void initializeDisplay();
+void initializeRTC();
+void initializeGPS();
+void initializeWiFi();
+void initializeWebServer();
+void updateDisplay();
+void checkBellSchedule();
+void ringBell(int duration = BELL_DURATION);
+void processSerialInput();
+void readGPSData();
+void syncTimeFromGPS();
+void printMenu();
+void handleRoot();
+void handleStatus();
+void handleSetTime();
+void handleAddBell();
+void handleListBells();
+void handleRingBell();
+
+// ==================== Setup ====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n========================================");
+  Serial.println("   IoT-Based Bell Monitoring System");
+  Serial.println("========================================\n");
+  
+  initializeSystem();
+  printMenu();
+}
+
+// ==================== Main Loop ====================
+void loop() {
+  // Read GPS data continuously
+  readGPSData();
+  
+  // Get current time
+  DateTime now = rtc.now();
+  
+  // Update display every 500ms
+  if (millis() - lastDisplayUpdate > 500) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+  
+  // Check bell schedule
+  checkBellSchedule();
+  
+  // Process serial commands
+  if (inputComplete) {
+    processSerialInput();
+    inputComplete = false;
+  }
+  
+  // Handle web server requests
+  if (status.wifiConnected) {
+    server.handleClient();
+  }
+  
+  delay(100);
+}
+
+// ==================== Initialization Functions ====================
+void initializeSystem() {
+  // Initialize pins
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Initialize status
+  memset(&status, 0, sizeof(status));
+  
+  // Initialize I2C
+  Wire.begin(SDA_PIN, SCL_PIN);
+  
+  // Initialize components
+  initializeDisplay();
+  initializeRTC();
+  initializeGPS();
+  initializeWiFi();
+  
+  if (status.wifiConnected) {
+    initializeWebServer();
+  }
+  
+  // Add default bell schedules
+  addDefaultBellSchedule();
+}
+
+void initializeDisplay() {
+  Serial.print("Initializing OLED Display... ");
+  
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("FAILED!");
+    status.displayOK = false;
+    return;
+  }
+  
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(10, 25);
+  display.println("Bell System");
+  display.setCursor(10, 40);
+  display.println("Initializing...");
+  display.display();
+  
+  status.displayOK = true;
+  Serial.println("OK");
+}
+
+void initializeRTC() {
+  Serial.print("Initializing RTC DS3231... ");
+  
+  if (!rtc.begin()) {
+    Serial.println("FAILED!");
+    status.rtcOK = false;
+    return;
+  }
+  
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting to compile time");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  
+  status.rtcOK = true;
+  DateTime now = rtc.now();
+  Serial.printf("OK - Current time: %02d/%02d/%04d %02d:%02d:%02d\n",
+                now.day(), now.month(), now.year(),
+                now.hour(), now.minute(), now.second());
+}
+
+void initializeGPS() {
+  Serial.print("Initializing GPS Module... ");
+  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("OK (waiting for fix)");
+}
+
+void initializeWiFi() {
+  Serial.print("Connecting to WiFi... ");
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    status.wifiConnected = true;
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    status.wifiConnected = false;
+    Serial.println("\nWiFi Connection Failed!");
+  }
+}
+
+void initializeWebServer() {
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/settime", handleSetTime);
+  server.on("/addbell", handleAddBell);
+  server.on("/listbells", handleListBells);
+  server.on("/ringbell", handleRingBell);
+  server.on("/deleteBell", handleDeleteBell);
+  
+  server.begin();
+  Serial.println("Web Server Started");
+}
+
+void addDefaultBellSchedule() {
+  // Add some default bell times (school bell example)
+  addBellTime(8, 0, "Morning Assembly", true);
+  addBellTime(9, 0, "Period 1", true);
+  addBellTime(10, 0, "Period 2", true);
+  addBellTime(11, 0, "Break", true);
+  addBellTime(11, 30, "Period 3", true);
+  addBellTime(12, 30, "Lunch", true);
+  addBellTime(13, 30, "Period 4", true);
+  addBellTime(14, 30, "Period 5", true);
+  addBellTime(15, 30, "Dismissal", true);
+}
+
+// ==================== Display Functions ====================
+void updateDisplay() {
+  if (!status.displayOK) return;
+  
+  DateTime now = rtc.now();
+  
+  display.clearDisplay();
+  
+  // Header - Current Time (Large)
+  display.setTextSize(2);
+  display.setCursor(10, 0);
+  display.printf("%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+  
+  // Date
+  display.setTextSize(1);
+  display.setCursor(5, 20);
+  display.printf("%02d/%02d/%04d", now.day(), now.month(), now.year());
+  
+  // Day of week
+  const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+  display.setCursor(80, 20);
+  display.print(days[now.dayOfTheWeek()]);
+  
+  // Draw separator line
+  display.drawLine(0, 30, 128, 30, SSD1306_WHITE);
+  
+  // Show different info based on display page (rotates every 3 seconds)
+  int page = (millis() / 3000) % 3;
+  
+  switch (page) {
+    case 0:  // Next Bell
+      displayNextBell(now);
+      break;
+    case 1:  // GPS Info
+      displayGPSInfo();
+      break;
+    case 2:  // System Status
+      displaySystemStatus();
+      break;
+  }
+  
+  display.display();
+}
+
+void displayNextBell(DateTime now) {
+  display.setCursor(0, 35);
+  display.print("Next Bell:");
+  
+  int nextIndex = getNextBellIndex(now);
+  if (nextIndex >= 0) {
+    display.setCursor(0, 45);
+    display.printf("%02d:%02d - %s", 
+                   bellSchedule[nextIndex].hour,
+                   bellSchedule[nextIndex].minute,
+                   bellSchedule[nextIndex].label);
+    
+    // Calculate time remaining
+    int currentMins = now.hour() * 60 + now.minute();
+    int bellMins = bellSchedule[nextIndex].hour * 60 + bellSchedule[nextIndex].minute;
+    int remaining = bellMins - currentMins;
+    if (remaining <= 0) remaining += 24 * 60;
+    
+    display.setCursor(0, 55);
+    display.printf("In: %dh %dm", remaining / 60, remaining % 60);
+  } else {
+    display.setCursor(0, 45);
+    display.print("No bells scheduled");
+  }
+}
+
+void displayGPSInfo() {
+  display.setCursor(0, 35);
+  display.print("GPS Status:");
+  
+  if (status.gpsValid) {
+    display.setCursor(0, 45);
+    display.printf("Lat: %.5f", status.latitude);
+    display.setCursor(0, 55);
+    display.printf("Lng: %.5f", status.longitude);
+  } else {
+    display.setCursor(0, 45);
+    display.print("Searching for");
+    display.setCursor(0, 55);
+    display.print("satellite signal...");
+  }
+}
+
+void displaySystemStatus() {
+  display.setCursor(0, 35);
+  display.printf("WiFi: %s", status.wifiConnected ? "Connected" : "Disconnected");
+  
+  display.setCursor(0, 45);
+  display.printf("RTC: %s  GPS: %s", 
+                 status.rtcOK ? "OK" : "ERR",
+                 status.gpsValid ? "OK" : "N/A");
+  
+  display.setCursor(0, 55);
+  display.printf("Bells Today: %d", status.bellRingCount);
+}
+
+// ==================== Bell Functions ====================
+void checkBellSchedule() {
+  static int lastMinute = -1;
+  
+  DateTime now = rtc.now();
+  
+  // Only check once per minute
+  if (now.minute() == lastMinute) return;
+  lastMinute = now.minute();
+  
+  int dayOfWeek = now.dayOfTheWeek();
+  
+  for (int i = 0; i < bellCount; i++) {
+    if (bellSchedule[i].enabled &&
+        bellSchedule[i].hour == now.hour() &&
+        bellSchedule[i].minute == now.minute() &&
+        bellSchedule[i].daysOfWeek[dayOfWeek]) {
+      
+      Serial.printf("BELL TIME: %s (%02d:%02d)\n", 
+                    bellSchedule[i].label,
+                    bellSchedule[i].hour,
+                    bellSchedule[i].minute);
+      ringBell();
+      status.bellRingCount++;
+      status.lastBellTime = millis();
+      break;
+    }
+  }
+}
+
+void ringBell(int duration) {
+  Serial.println(">>> RINGING BELL <<<");
+  
+  // Show on display
+  if (status.displayOK) {
+    display.clearDisplay();
+    display.setTextSize(3);
+    display.setCursor(15, 20);
+    display.print("BELL!");
+    display.display();
+  }
+  
+  // Activate relay and optional buzzer
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
+  
+  delay(duration);
+  
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  
+  Serial.println(">>> BELL STOPPED <<<");
+}
+
+int getNextBellIndex(DateTime now) {
+  int currentMinutes = now.hour() * 60 + now.minute();
+  int dayOfWeek = now.dayOfTheWeek();
+  int nextBell = -1;
+  int minDiff = 24 * 60 + 1;
+  
+  for (int i = 0; i < bellCount; i++) {
+    if (bellSchedule[i].enabled && bellSchedule[i].daysOfWeek[dayOfWeek]) {
+      int bellMinutes = bellSchedule[i].hour * 60 + bellSchedule[i].minute;
+      int diff = bellMinutes - currentMinutes;
+      
+      if (diff <= 0) diff += 24 * 60;
+      
+      if (diff < minDiff) {
+        minDiff = diff;
+        nextBell = i;
+      }
+    }
+  }
+  
+  return nextBell;
+}
+
+bool addBellTime(int hour, int minute, const char* label, bool allDays) {
+  if (bellCount >= MAX_BELL_SCHEDULES) {
+    Serial.println("Error: Maximum bell schedules reached!");
+    return false;
+  }
+  
+  bellSchedule[bellCount].hour = hour;
+  bellSchedule[bellCount].minute = minute;
+  bellSchedule[bellCount].enabled = true;
+  strncpy(bellSchedule[bellCount].label, label, 19);
+  bellSchedule[bellCount].label[19] = '\0';
+  
+  for (int i = 0; i < 7; i++) {
+    bellSchedule[bellCount].daysOfWeek[i] = allDays;
+  }
+  
+  bellCount++;
+  return true;
+}
+
+bool removeBellTime(int index) {
+  if (index < 0 || index >= bellCount) {
+    return false;
+  }
+  
+  for (int i = index; i < bellCount - 1; i++) {
+    bellSchedule[i] = bellSchedule[i + 1];
+  }
+  bellCount--;
+  return true;
+}
+
+// ==================== GPS Functions ====================
+void readGPSData() {
+  while (SerialGPS.available() > 0) {
+    char c = SerialGPS.read();
+    gps.encode(c);
+    
+    if (gps.location.isUpdated() && gps.location.isValid()) {
+      status.gpsValid = true;
+      status.latitude = gps.location.lat();
+      status.longitude = gps.location.lng();
+    }
+  }
+}
+
+void syncTimeFromGPS() {
+  if (gps.date.isValid() && gps.time.isValid()) {
+    // Note: GPS time is in UTC, you may need to add timezone offset
+    int timezoneOffset = 5;  // Example: IST is UTC+5:30
+    int timezoneMinOffset = 30;
+    
+    int hour = gps.time.hour() + timezoneOffset;
+    int minute = gps.time.minute() + timezoneMinOffset;
+    int day = gps.date.day();
+    int month = gps.date.month();
+    int year = gps.date.year();
+    
+    // Handle minute overflow
+    if (minute >= 60) {
+      minute -= 60;
+      hour++;
+    }
+    
+    // Handle hour overflow
+    if (hour >= 24) {
+      hour -= 24;
+      day++;
+      // Note: This doesn't handle month/year overflow properly
+    }
+    
+    rtc.adjust(DateTime(year, month, day, hour, minute, gps.time.second()));
+    Serial.println("RTC synced with GPS time!");
+  } else {
+    Serial.println("GPS time not available for sync");
+  }
+}
+
+// ==================== Serial Interface ====================
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar == '\n' || inChar == '\r') {
+      if (inputString.length() > 0) {
+        inputComplete = true;
+      }
+    } else {
+      inputString += inChar;
+    }
+  }
+}
+
+void printMenu() {
+  Serial.println("\n============ COMMANDS ============");
+  Serial.println("T YYYY MM DD HH MM SS - Set time");
+  Serial.println("A HH:MM Label         - Add bell");
+  Serial.println("R index               - Remove bell");
+  Serial.println("L                     - List bells");
+  Serial.println("E index 0/1           - Enable/Disable");
+  Serial.println("G                     - Show GPS");
+  Serial.println("S                     - Sync from GPS");
+  Serial.println("B                     - Ring bell now");
+  Serial.println("W                     - Show WiFi info");
+  Serial.println("H                     - Show this menu");
+  Serial.println("==================================\n");
+}
+
+void processSerialInput() {
+  inputString.trim();
+  
+  if (inputString.length() == 0) return;
+  
+  char cmd = toupper(inputString.charAt(0));
+  String params = inputString.substring(2);
+  
+  switch (cmd) {
+    case 'T':  // Set Time
+      processSetTime(params);
+      break;
+      
+    case 'A':  // Add Bell
+      processAddBell(params);
+      break;
+      
+    case 'R':  // Remove Bell
+      processRemoveBell(params);
+      break;
+      
+    case 'L':  // List Bells
+      listAllBells();
+      break;
+      
+    case 'E':  // Enable/Disable
+      processEnableBell(params);
+      break;
+      
+    case 'G':  // Show GPS
+      showGPSInfo();
+      break;
+      
+    case 'S':  // Sync from GPS
+      syncTimeFromGPS();
+      break;
+      
+    case 'B':  // Ring Bell
+      ringBell();
+      break;
+      
+    case 'W':  // WiFi Info
+      showWiFiInfo();
+      break;
+      
+    case 'H':  // Help
+      printMenu();
+      break;
+      
+    default:
+      Serial.println("Unknown command. Type 'H' for help.");
+  }
+  
+  inputString = "";
+}
+
+void processSetTime(String params) {
+  int year, month, day, hour, minute, second;
+  
+  if (sscanf(params.c_str(), "%d %d %d %d %d %d", 
+             &year, &month, &day, &hour, &minute, &second) == 6) {
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+    Serial.printf("Time set to: %04d/%02d/%02d %02d:%02d:%02d\n",
+                  year, month, day, hour, minute, second);
+  } else {
+    Serial.println("Invalid format! Use: T YYYY MM DD HH MM SS");
+  }
+}
+
+void processAddBell(String params) {
+  int hour, minute;
+  char label[20] = "Bell";
+  
+  int colonPos = params.indexOf(':');
+  if (colonPos > 0) {
+    hour = params.substring(0, colonPos).toInt();
+    
+    int spacePos = params.indexOf(' ', colonPos);
+    if (spacePos > 0) {
+      minute = params.substring(colonPos + 1, spacePos).toInt();
+      params.substring(spacePos + 1).toCharArray(label, 20);
+    } else {
+      minute = params.substring(colonPos + 1).toInt();
+    }
+    
+    if (addBellTime(hour, minute, label, true)) {
+      Serial.printf("Added bell: %02d:%02d - %s\n", hour, minute, label);
+    }
+  } else {
+    Serial.println("Invalid format! Use: A HH:MM Label");
+  }
+}
+
+void processRemoveBell(String params) {
+  int index = params.toInt();
+  
+  if (removeBellTime(index)) {
+    Serial.printf("Removed bell at index %d\n", index);
+  } else {
+    Serial.println("Invalid index!");
+  }
+}
+
+void processEnableBell(String params) {
+  int index, enable;
+  
+  if (sscanf(params.c_str(), "%d %d", &index, &enable) == 2) {
+    if (index >= 0 && index < bellCount) {
+      bellSchedule[index].enabled = (enable != 0);
+      Serial.printf("Bell %d %s\n", index, enable ? "enabled" : "disabled");
+    } else {
+      Serial.println("Invalid index!");
+    }
+  } else {
+    Serial.println("Invalid format! Use: E index 0/1");
+  }
+}
+
+void listAllBells() {
+  Serial.println("\n========== BELL SCHEDULE ==========");
+  Serial.println("IDX  TIME   STATUS   LABEL");
+  Serial.println("------------------------------------");
+  
+  for (int i = 0; i < bellCount; i++) {
+    Serial.printf("[%2d] %02d:%02d  %-8s %s\n",
+                  i,
+                  bellSchedule[i].hour,
+                  bellSchedule[i].minute,
+                  bellSchedule[i].enabled ? "ENABLED" : "disabled",
+                  bellSchedule[i].label);
+  }
+  
+  Serial.println("====================================\n");
+}
+
+void showGPSInfo() {
+  Serial.println("\n========== GPS INFO ==========");
+  
+  if (status.gpsValid) {
+    Serial.printf("Latitude:  %.6f\n", status.latitude);
+    Serial.printf("Longitude: %.6f\n", status.longitude);
+    
+    if (gps.altitude.isValid()) {
+      Serial.printf("Altitude:  %.1f m\n", gps.altitude.meters());
+    }
+    if (gps.satellites.isValid()) {
+      Serial.printf("Satellites: %d\n", gps.satellites.value());
+    }
+    if (gps.date.isValid() && gps.time.isValid()) {
+      Serial.printf("GPS Time (UTC): %04d/%02d/%02d %02d:%02d:%02d\n",
+                    gps.date.year(), gps.date.month(), gps.date.day(),
+                    gps.time.hour(), gps.time.minute(), gps.time.second());
+    }
+  } else {
+    Serial.println("GPS: Waiting for satellite fix...");
+    Serial.printf("Characters processed: %lu\n", gps.charsProcessed());
+  }
+  
+  Serial.println("==============================\n");
+}
+
+void showWiFiInfo() {
+  Serial.println("\n========== WIFI INFO ==========");
+  
+  if (status.wifiConnected) {
+    Serial.println("Status: Connected");
+    Serial.print("SSID: ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal Strength: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+    Serial.print("Web Interface: http://");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("Status: Disconnected");
+  }
+  
+  Serial.println("===============================\n");
+}
+
+// ==================== Web Server Handlers ====================
+void handleRoot() {
+  DateTime now = rtc.now();
+  
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta http-equiv='refresh' content='10'>";
+  html += "<title>IoT Bell System</title>";
+  html += "<style>";
+  html += "body{font-family:Arial,sans-serif;margin:20px;background:#f0f0f0;}";
+  html += ".container{max-width:800px;margin:auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
+  html += "h1{color:#333;text-align:center;}";
+  html += ".time{font-size:48px;text-align:center;color:#2196F3;margin:20px 0;}";
+  html += ".date{font-size:24px;text-align:center;color:#666;margin-bottom:20px;}";
+  html += ".section{margin:20px 0;padding:15px;background:#f9f9f9;border-radius:5px;}";
+  html += ".section h2{margin-top:0;color:#444;}";
+  html += ".btn{background:#2196F3;color:white;padding:10px 20px;border:none;border-radius:5px;cursor:pointer;margin:5px;}";
+  html += ".btn:hover{background:#1976D2;}";
+  html += ".btn-danger{background:#f44336;}";
+  html += ".btn-danger:hover{background:#d32f2f;}";
+  html += ".status{display:inline-block;padding:5px 10px;border-radius:3px;margin:5px;}";
+  html += ".status-ok{background:#4CAF50;color:white;}";
+  html += ".status-error{background:#f44336;color:white;}";
+  html += "table{width:100%;border-collapse:collapse;}";
+  html += "th,td{padding:10px;text-align:left;border-bottom:1px solid #ddd;}";
+  html += "th{background:#2196F3;color:white;}";
+  html += "input,select{padding:8px;margin:5px;border:1px solid #ddd;border-radius:4px;}";
+  html += "</style></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<h1>🔔 IoT Bell Monitoring System</h1>";
+  
+  // Current Time
+  html += "<div class='time'>";
+  html += String(now.hour() < 10 ? "0" : "") + String(now.hour()) + ":";
+  html += String(now.minute() < 10 ? "0" : "") + String(now.minute()) + ":";
+  html += String(now.second() < 10 ? "0" : "") + String(now.second());
+  html += "</div>";
+  
+  html += "<div class='date'>";
+  html += String(now.day()) + "/" + String(now.month()) + "/" + String(now.year());
+  html += "</div>";
+  
+  // System Status
+  html += "<div class='section'>";
+  html += "<h2>System Status</h2>";
+  html += "<span class='status " + String(status.rtcOK ? "status-ok" : "status-error") + "'>RTC: " + String(status.rtcOK ? "OK" : "ERROR") + "</span>";
+  html += "<span class='status " + String(status.displayOK ? "status-ok" : "status-error") + "'>Display: " + String(status.displayOK ? "OK" : "ERROR") + "</span>";
+  html += "<span class='status " + String(status.gpsValid ? "status-ok" : "status-error") + "'>GPS: " + String(status.gpsValid ? "Fixed" : "Searching") + "</span>";
+  html += "<span class='status status-ok'>WiFi: Connected</span>";
+  html += "</div>";
+  
+  // GPS Location
+  if (status.gpsValid) {
+    html += "<div class='section'>";
+    html += "<h2>📍 GPS Location</h2>";
+    html += "<p>Latitude: " + String(status.latitude, 6) + "</p>";
+    html += "<p>Longitude: " + String(status.longitude, 6) + "</p>";
+    html += "<a href='https://www.google.com/maps?q=" + String(status.latitude, 6) + "," + String(status.longitude, 6) + "' target='_blank' class='btn'>View on Map</a>";
+    html += "</div>";
+  }
+  
+  // Bell Controls
+  html += "<div class='section'>";
+  html += "<h2>🔔 Bell Control</h2>";
+  html += "<a href='/ringbell' class='btn btn-danger'>Ring Bell Now</a>";
+  html += "</div>";
+  
+  // Bell Schedule
+  html += "<div class='section'>";
+  html += "<h2>📋 Bell Schedule</h2>";
+  html += "<table><tr><th>#</th><th>Time</th><th>Label</th><th>Status</th><th>Action</th></tr>";
+  
+  for (int i = 0; i < bellCount; i++) {
+    html += "<tr>";
+    html += "<td>" + String(i) + "</td>";
+    html += "<td>" + String(bellSchedule[i].hour < 10 ? "0" : "") + String(bellSchedule[i].hour) + ":" + String(bellSchedule[i].minute < 10 ? "0" : "") + String(bellSchedule[i].minute) + "</td>";
+    html += "<td>" + String(bellSchedule[i].label) + "</td>";
+    html += "<td><span class='status " + String(bellSchedule[i].enabled ? "status-ok" : "status-error") + "'>" + String(bellSchedule[i].enabled ? "Enabled" : "Disabled") + "</span></td>";
+    html += "<td><a href='/deleteBell?id=" + String(i) + "' class='btn btn-danger'>Delete</a></td>";
+    html += "</tr>";
+  }
+  
+  html += "</table></div>";
+  
+  // Add New Bell
+  html += "<div class='section'>";
+  html += "<h2>➕ Add New Bell</h2>";
+  html += "<form action='/addbell' method='GET'>";
+  html += "Hour: <input type='number' name='hour' min='0' max='23' required>";
+  html += "Minute: <input type='number' name='minute' min='0' max='59' required>";
+  html += "Label: <input type='text' name='label' maxlength='19'>";
+  html += "<input type='submit' value='Add Bell' class='btn'>";
+  html += "</form></div>";
+  
+  // Set Time
+  html += "<div class='section'>";
+  html += "<h2>⏰ Set Time</h2>";
+  html += "<form action='/settime' method='GET'>";
+  html += "Date: <input type='date' name='date' required>";
+  html += "Time: <input type='time' name='time' required>";
+  html += "<input type='submit' value='Set Time' class='btn'>";
+  html += "</form></div>";
+  
+  html += "<p style='text-align:center;color:#999;'>Auto-refresh every 10 seconds | Bells Today: " + String(status.bellRingCount) + "</p>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleStatus() {
+  DateTime now = rtc.now();
+  
+  String json = "{";
+  json += "\"time\":\"" + String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second()) + "\",";
+  json += "\"date\":\"" + String(now.day()) + "/" + String(now.month()) + "/" + String(now.year()) + "\",";
+  json += "\"rtcOK\":" + String(status.rtcOK ? "true" : "false") + ",";
+  json += "\"gpsValid\":" + String(status.gpsValid ? "true" : "false") + ",";
+  json += "\"latitude\":" + String(status.latitude, 6) + ",";
+  json += "\"longitude\":" + String(status.longitude, 6) + ",";
+  json += "\"bellCount\":" + String(bellCount) + ",";
+  json += "\"bellsToday\":" + String(status.bellRingCount);
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleSetTime() {
+  if (server.hasArg("date") && server.hasArg("time")) {
+    String dateStr = server.arg("date");
+    String timeStr = server.arg("time");
+    
+    int year = dateStr.substring(0, 4).toInt();
+    int month = dateStr.substring(5, 7).toInt();
+    int day = dateStr.substring(8, 10).toInt();
+    int hour = timeStr.substring(0, 2).toInt();
+    int minute = timeStr.substring(3, 5).toInt();
+    
+    rtc.adjust(DateTime(year, month, day, hour, minute, 0));
+    
+    server.sendHeader("Location", "/");
+    server.send(303);
+  } else {
+    server.send(400, "text/plain", "Missing parameters");
+  }
+}
+
+void handleAddBell() {
+  if (server.hasArg("hour") && server.hasArg("minute")) {
+    int hour = server.arg("hour").toInt();
+    int minute = server.arg("minute").toInt();
+    String label = server.hasArg("label") ? server.arg("label") : "Bell";
+    
+    if (label.length() == 0) label = "Bell";
+    
+    char labelChar[20];
+    label.toCharArray(labelChar, 20);
+    
+    addBellTime(hour, minute, labelChar, true);
+    
+    server.sendHeader("Location", "/");
+    server.send(303);
+  } else {
+    server.send(400, "text/plain", "Missing parameters");
+  }
+}
+
+void handleListBells() {
+  String json = "[";
+  
+  for (int i = 0; i < bellCount; i++) {
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"hour\":" + String(bellSchedule[i].hour) + ",";
+    json += "\"minute\":" + String(bellSchedule[i].minute) + ",";
+    json += "\"enabled\":" + String(bellSchedule[i].enabled ? "true" : "false") + ",";
+    json += "\"label\":\"" + String(bellSchedule[i].label) + "\"";
+    json += "}";
+  }
+  
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleRingBell() {
+  ringBell();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDeleteBell() {
+  if (server.hasArg("id")) {
+    int id = server.arg("id").toInt();
+    removeBellTime(id);
+  }
+  
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
